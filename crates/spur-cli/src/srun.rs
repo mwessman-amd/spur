@@ -267,6 +267,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             &mut ctrl,
             job_id,
             args.command.clone(),
+            crate::export_env::resolve_export_env(&args.export, std::env::vars().collect()),
             node,
             &user,
             container_spec_from_srun_args(&args),
@@ -1053,6 +1054,7 @@ async fn run_standalone_srun(
             &mut client,
             job_id,
             args.command.clone(),
+            crate::export_env::resolve_export_env(&args.export, std::env::vars().collect()),
             String::new(),
             &owner,
             container_spec_from_srun_args(args),
@@ -1597,6 +1599,7 @@ async fn run_interactive_pty(
     ctrl: &mut SlurmControllerClient<crate::authclient::AuthChannel>,
     job_id: u32,
     command: Vec<String>,
+    env: HashMap<String, String>,
     node: String,
     user: &str,
     container: Option<ContainerSpec>,
@@ -1701,6 +1704,7 @@ async fn run_interactive_pty(
                     job_id,
                     step_id,
                     command.clone(),
+                    Some(env.clone()),
                     winsize,
                     true,
                     user,
@@ -1816,17 +1820,15 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
         );
     }
 
-    // The agent spawns the PTY from the job's own environment and work dir, so
-    // everything srun would otherwise pass through SPUR_* env is dropped.
-    let env_scoped = args.cpu_bind.is_some()
-        || args.gpu_bind.is_some()
+    // A --pty step sends only the --export-filtered environment, not the SPUR_*
+    // variables srun sets for these flags.
+    let env_scoped = crate::env_defaults::was_cli_set(matches, "cpu_bind")
+        || crate::env_defaults::was_cli_set(matches, "gpu_bind")
         || args.label
-        || crate::env_defaults::was_cli_set(matches, "mpi")
-        || crate::env_defaults::was_cli_set(matches, "export");
+        || crate::env_defaults::was_cli_set(matches, "mpi");
     if env_scoped {
         warnings.push(
-            "srun: warning: a --pty step runs in the job's environment; \
-             --cpu-bind/--gpu-bind/--label/--mpi/--export are ignored"
+            "srun: warning: --cpu-bind/--gpu-bind/--label/--mpi are not applied to a --pty step"
                 .into(),
         );
     }
@@ -1851,7 +1853,8 @@ fn step_dispatch_kind(args: &SrunArgs) -> StepDispatchKind {
 }
 
 /// Warn on unsupported `--cpu-bind` modes and reject a spec that cannot cover
-/// `ntasks`. Buffered steps only — a `--pty` step forwards no env, so it warns.
+/// `ntasks`. Buffered steps only — a `--pty` step does not forward `--cpu-bind`,
+/// so it warns instead.
 fn validate_step_cpu_bind(environment: &HashMap<String, String>, ntasks: u32) -> Result<()> {
     warn_unsupported_cpu_bind(environment);
     if let Some(err) = spur_core::task_launch::map_cpu_bind_error(environment, ntasks)
@@ -1899,6 +1902,7 @@ async fn run_as_step(
             &mut client,
             job_id,
             args.command.clone(),
+            crate::export_env::resolve_export_env(&args.export, std::env::vars().collect()),
             node,
             &user,
             container_spec_from_srun_args(args),
@@ -2072,6 +2076,31 @@ mod tests {
         let warnings = pty_step_unsupported_warnings(&args, &matches);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--cpu-bind/--gpu-bind/--label/--mpi"));
+        assert!(!warnings[0].contains("--export"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn pty_step_silent_when_binding_came_from_the_environment() {
+        let env = EnvGuard::new();
+        env.set("SPUR_CPU_BIND", "cores");
+        env.set("SPUR_GPU_BIND", "closest");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--pty", "bash"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert!(args.cpu_bind.is_some());
+        assert!(args.gpu_bind.is_some());
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
+    }
+
+    #[test]
+    fn pty_step_does_not_warn_that_export_is_ignored() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "--export=NONE", "bash"]);
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
     }
 
     /// `--chdir` still sets the prolog/epilog working directory, so it gets its
@@ -3166,6 +3195,7 @@ mod tests {
             &mut client,
             1,
             vec!["bash".to_string()],
+            HashMap::new(),
             String::new(),
             "tester",
             None,
@@ -3195,6 +3225,7 @@ mod tests {
             &mut client,
             1,
             vec!["bash".into()],
+            HashMap::new(),
             String::new(),
             "tester",
             None,
@@ -3312,6 +3343,7 @@ mod tests {
             &mut client,
             1,
             vec!["bash".into()],
+            HashMap::new(),
             String::new(),
             "tester",
             None,
@@ -3355,6 +3387,7 @@ mod tests {
             &mut client,
             1,
             vec!["bash".into()],
+            HashMap::new(),
             String::new(),
             "tester",
             None,
@@ -3395,6 +3428,7 @@ mod tests {
             &mut client,
             1,
             vec!["bash".into()],
+            HashMap::new(),
             String::new(),
             "tester",
             None,
@@ -3431,6 +3465,7 @@ mod tests {
             &mut client,
             1,
             vec!["bash".into()],
+            HashMap::new(),
             String::new(),
             "tester",
             None,

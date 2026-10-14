@@ -229,6 +229,9 @@ pub struct InteractiveSessionHandle {
 
 /// Open the InteractiveSession RPC, returning the raw handle.
 ///
+/// `env` is the submitted environment for a new step, as a plain srun step
+/// sends it; `None` when reattaching to an existing session.
+///
 /// Returns `Err(tonic::Status)` on RPC failure.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_interactive_session(
@@ -236,6 +239,7 @@ pub async fn open_interactive_session(
     job_id: u32,
     step_id: u32,
     argv: Vec<String>,
+    env: Option<HashMap<String, String>>,
     winsize: spur_proto::proto::WindowSize,
     overlap: bool,
     user: &str,
@@ -246,6 +250,7 @@ pub async fn open_interactive_session(
     // on hangup. Flag it so the agent drains output instead of SIGHUP-ing the
     // step; interactive clients keep hangup-on-disconnect.
     let non_interactive = !std::io::stdin().is_terminal();
+    let env_is_authoritative = env.is_some();
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
             job_id,
@@ -254,11 +259,12 @@ pub async fn open_interactive_session(
             pty: true,
             winsize: Some(winsize),
             argv,
-            env: HashMap::new(),
+            env: env.unwrap_or_default(),
             user: user.to_string(),
             container,
             non_interactive,
             execution_credential,
+            env_is_authoritative,
         })),
     };
 
@@ -384,6 +390,7 @@ pub async fn run_interactive_session(
         job_id,
         step_id,
         argv,
+        None,
         winsize,
         overlap,
         user,

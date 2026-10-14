@@ -3026,20 +3026,22 @@ fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::proces
     }
 }
 
-/// Builds a fresh interactive step's process environment, in the same
-/// precedence the old direct-fork paths used: a `TERM` default, the job's own
-/// session, its `SPUR_JOB_ID`/`SLURM_JOB_ID`, then host or fresh-container
-/// identity vars — later layers win so a fresh container's own GPU/identity
-/// vars are never shadowed by the parent session's.
+/// Builds a fresh interactive step's process environment. Pre-marker clients
+/// inherit the job's running session; current clients send the complete,
+/// export-filtered step environment. Host or fresh-container identity wins
+/// over either source.
 fn interactive_step_environment(
     session_env: Vec<(String, String)>,
+    step_env_is_authoritative: bool,
     job_env_vars: Vec<(String, String)>,
     host_identity_env: Option<HashMap<String, String>>,
     fresh_container_env: Option<HashMap<String, String>>,
 ) -> HashMap<String, String> {
     let mut environment: HashMap<String, String> =
         [("TERM".to_string(), "xterm-256color".to_string())].into();
-    environment.extend(session_env);
+    if !step_env_is_authoritative {
+        environment.extend(session_env);
+    }
     environment.extend(job_env_vars);
     if let Some(host_identity) = host_identity_env {
         environment.extend(host_identity);
@@ -3048,6 +3050,66 @@ fn interactive_step_environment(
         environment.extend(fresh);
     }
     environment
+}
+
+/// Inputs for [`step_environment`], resolved from the step request and the
+/// tracked job by each launch path.
+struct StepEnvInput<'a> {
+    submitted: &'a HashMap<String, String>,
+    job_id: u32,
+    step_id: u32,
+    step_num_tasks: u32,
+    partition: &'a str,
+    job_nodelist: &'a str,
+    step_nodelist: &'a str,
+    hostname: &'a str,
+    cpus: u32,
+    gpu_devices: &'a [u64],
+    gpu_env: &'a HashMap<String, String>,
+}
+
+/// An srun step's environment on this node: the submitted env with the job
+/// context, GPU visibility, and step scope layered over it. Shared by plain and
+/// `--pty` steps so an interactive shell gets what a normal step gets.
+fn step_environment(input: &StepEnvInput<'_>) -> SpurEnv {
+    let (node_id, num_nodes) = step_node_position(input.step_nodelist, input.hostname);
+    let job_num_nodes = input
+        .job_nodelist
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .count()
+        .max(1) as u32;
+
+    let mut senv = SpurEnv::new();
+    senv.extend(input.submitted);
+    senv.set_with_slurm_twin("SPUR_JOB_ID", input.job_id);
+    senv.set_with_slurm_twin("SPUR_JOBID", input.job_id);
+    senv.set_with_slurm_twin("SPUR_JOB_PARTITION", input.partition);
+    senv.set_with_slurm_twin("SPUR_NODELIST", input.step_nodelist);
+    senv.set_with_slurm_twin("SPUR_JOB_NODELIST", input.job_nodelist);
+    senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", input.cpus);
+    senv.extend(input.gpu_env);
+    let mut bind_env = HashMap::new();
+    spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, input.submitted, input.gpu_devices);
+    senv.extend(&bind_env);
+    SpurEnv::apply_step_scope(
+        &mut senv,
+        input.job_id,
+        input.step_id,
+        input.step_num_tasks,
+        node_id,
+        num_nodes,
+    );
+    senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job_num_nodes);
+    senv
+}
+
+/// This node's index in a comma-separated step nodelist, and the node count.
+/// A host missing from the list is treated as the first node.
+fn step_node_position(step_nodelist: &str, hostname: &str) -> (u32, u32) {
+    let node_names: Vec<&str> = step_nodelist.split(',').filter(|s| !s.is_empty()).collect();
+    let node_id = node_names.iter().position(|n| *n == hostname).unwrap_or(0) as u32;
+    (node_id, node_names.len().max(1) as u32)
 }
 
 /// The supervisor forks the workload after the gate opens, so its pid is not
@@ -6745,18 +6807,7 @@ impl SlurmAgent for AgentService {
         } else {
             req.nodelist.clone()
         };
-        let agent_hostname = self.reporter.hostname.clone();
-        let node_names: Vec<&str> = step_nodelist.split(',').filter(|s| !s.is_empty()).collect();
-        let num_nodes = node_names.len().max(1) as u32;
-        let node_id = node_names
-            .iter()
-            .position(|n| *n == agent_hostname)
-            .unwrap_or(0) as u32;
-        let job_num_nodes = job_nodelist
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .count()
-            .max(1) as u32;
+        let (node_id, _) = step_node_position(&step_nodelist, &self.reporter.hostname);
 
         let (mut gpu_env, host_device_plan, container_device_plan) = if gpu_devices.is_empty() {
             (HashMap::new(), None, None)
@@ -6777,18 +6828,19 @@ impl SlurmAgent for AgentService {
         };
         maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
 
-        let mut senv = SpurEnv::new();
-        senv.extend(&req.environment);
-        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
-        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
-        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
-        senv.set_with_slurm_twin("SPUR_NODELIST", &step_nodelist);
-        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &job_nodelist);
-        senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
-        senv.extend(&gpu_env);
-        let mut bind_env = HashMap::new();
-        spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, &req.environment, &gpu_devices);
-        senv.extend(&bind_env);
+        let mut senv = step_environment(&StepEnvInput {
+            submitted: &req.environment,
+            job_id,
+            step_id,
+            step_num_tasks,
+            partition: &partition,
+            job_nodelist: &job_nodelist,
+            step_nodelist: &step_nodelist,
+            hostname: &self.reporter.hostname,
+            cpus,
+            gpu_devices: &gpu_devices,
+            gpu_env: &gpu_env,
+        });
         if let Some(cpu_bind) = spur_core::task_launch::unsupported_cpu_bind(&req.environment) {
             warn!(
                 job_id,
@@ -6803,15 +6855,6 @@ impl SlurmAgent for AgentService {
         {
             return Err(Status::invalid_argument(err));
         }
-        SpurEnv::apply_step_scope(
-            &mut senv,
-            job_id,
-            step_id,
-            step_num_tasks,
-            node_id,
-            num_nodes,
-        );
-        senv.set_with_slurm_twin("SPUR_JOB_NUM_NODES", job_num_nodes);
         if req.label {
             senv.set("SPUR_LABEL", "1");
         }
@@ -8046,6 +8089,25 @@ impl SlurmAgent for AgentService {
                     let mut container_rootfs_mode = None;
                     let mut fresh_container_env: Option<HashMap<String, String>> = None;
                     let mut host_identity_env: Option<HashMap<String, String>> = None;
+                    let build_step_env = |mut gpu_env: HashMap<String, String>| {
+                        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
+                        let mut senv = step_environment(&StepEnvInput {
+                            submitted: &init.env,
+                            job_id: init.job_id,
+                            step_id: init.step_id,
+                            step_num_tasks: 1,
+                            partition: &partition,
+                            job_nodelist: &nodelist,
+                            step_nodelist: &self.reporter.hostname,
+                            hostname: &self.reporter.hostname,
+                            cpus,
+                            gpu_devices: &gpu_devices,
+                            gpu_env: &gpu_env,
+                        });
+                        SpurEnv::apply_task_rank(&mut senv, 0, 0);
+                        senv.into_map()
+                    };
+                    let step_env;
                     let container = match &container_plan {
                         StepContainerPlan::None => {
                             if parent_has_namespaces {
@@ -8089,13 +8151,20 @@ impl SlurmAgent for AgentService {
                                     entry.gid,
                                 )
                                 .await?;
+                            // Merged into the step env with --gpu-bind precedence, as for a
+                            // plain srun step; cleared so the executor doesn't re-apply it.
+                            let gpu_env = host_device_plan
+                                .as_mut()
+                                .map(|plan| std::mem::take(&mut plan.env))
+                                .unwrap_or_default();
+                            step_env = build_step_env(gpu_env);
                             None
                         }
                         StepContainerPlan::Fresh(c) => {
                             let (gpu_env, container_device_plan) = if gpu_devices.is_empty() {
                                 (HashMap::new(), None)
                             } else {
-                                let (host_plan, container_plan) = self
+                                let (mut host_plan, container_plan) = self
                                     .device_registry
                                     .lock()
                                     .await
@@ -8110,7 +8179,9 @@ impl SlurmAgent for AgentService {
                                             "GPU injection plan failed: {e}"
                                         ))
                                     })?;
-                                let env = host_plan.env.clone();
+                                // Merged into the step env with --gpu-bind precedence; cleared
+                                // so the executor doesn't re-apply the full allocation over it.
+                                let env = std::mem::take(&mut host_plan.env);
                                 host_device_plan = Some(host_plan);
                                 (env, Some(container_plan))
                             };
@@ -8130,8 +8201,8 @@ impl SlurmAgent for AgentService {
                             let home_dir = passwd_entry
                                 .map(|u| u.dir.to_string_lossy().into_owned())
                                 .unwrap_or_else(|| format!("/home/{username}"));
-                            let mut env = HashMap::new();
-                            env.extend(gpu_env.clone());
+                            step_env = build_step_env(gpu_env);
+                            let mut env = step_env.clone();
                             env.insert("HOME".to_string(), home_dir.clone());
                             env.insert("USER".to_string(), username.clone());
                             env.insert("LOGNAME".to_string(), username.clone());
@@ -8178,7 +8249,8 @@ impl SlurmAgent for AgentService {
                         array_task_id: None,
                         environment: interactive_step_environment(
                             Self::session_environ(&entry),
-                            entry.env_vars(init.job_id),
+                            init.env_is_authoritative,
+                            step_env.into_iter().collect(),
                             host_identity_env,
                             fresh_container_env,
                         ),
@@ -12499,8 +12571,13 @@ mod tests {
         fresh_container_env.insert("SPUR_JOB_GPUS".to_string(), "0,1".to_string());
         fresh_container_env.insert("HOME".to_string(), "/home/spur".to_string());
 
-        let environment =
-            interactive_step_environment(session_env, Vec::new(), None, Some(fresh_container_env));
+        let environment = interactive_step_environment(
+            session_env,
+            false,
+            Vec::new(),
+            None,
+            Some(fresh_container_env),
+        );
 
         assert_eq!(
             environment.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
@@ -12539,7 +12616,7 @@ mod tests {
         ]));
 
         let environment =
-            interactive_step_environment(Vec::new(), job_env_vars, host_identity_env, None);
+            interactive_step_environment(Vec::new(), false, job_env_vars, host_identity_env, None);
 
         assert_eq!(
             environment.get("TERM").map(String::as_str),
@@ -12566,6 +12643,122 @@ mod tests {
             environment.get("SHELL").map(String::as_str),
             Some("/bin/bash")
         );
+    }
+
+    #[test]
+    fn interactive_step_environment_drops_session_vars_for_authoritative_step_env() {
+        let session_env = vec![
+            ("SECRET".to_string(), "job-secret".to_string()),
+            ("PATH".to_string(), "/job/bin".to_string()),
+        ];
+        let job_env_vars = vec![("PATH".to_string(), "/step/bin".to_string())];
+
+        let environment = interactive_step_environment(session_env, true, job_env_vars, None, None);
+
+        assert!(!environment.contains_key("SECRET"));
+        assert_eq!(
+            environment.get("PATH").map(String::as_str),
+            Some("/step/bin")
+        );
+    }
+
+    fn step_env_fixture<'a>(
+        submitted: &'a HashMap<String, String>,
+        gpu_devices: &'a [u64],
+        gpu_env: &'a HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        step_environment(&StepEnvInput {
+            submitted,
+            job_id: 42,
+            step_id: 3,
+            step_num_tasks: 1,
+            partition: "gpu",
+            job_nodelist: "node1,node2",
+            step_nodelist: "node1,node2",
+            hostname: "node2",
+            cpus: 8,
+            gpu_devices,
+            gpu_env,
+        })
+        .into_map()
+    }
+
+    #[test]
+    fn step_environment_keeps_the_submitted_env_under_the_job_context() {
+        let submitted = HashMap::from([
+            ("PATH".to_string(), "/opt/tools/bin:/usr/bin".to_string()),
+            (
+                "SPUR_CONTROLLER_ADDR".to_string(),
+                "http://ctl:6817".to_string(),
+            ),
+            ("FOO".to_string(), "hello".to_string()),
+        ]);
+        let env = step_env_fixture(&submitted, &[], &HashMap::new());
+
+        for (name, value) in [
+            ("PATH", "/opt/tools/bin:/usr/bin"),
+            ("SPUR_CONTROLLER_ADDR", "http://ctl:6817"),
+            ("FOO", "hello"),
+        ] {
+            assert_eq!(env.get(name).map(String::as_str), Some(value), "{name}");
+        }
+        for (name, value) in [
+            ("JOB_ID", "42"),
+            ("JOB_PARTITION", "gpu"),
+            ("JOB_NODELIST", "node1,node2"),
+            ("CPUS_ON_NODE", "8"),
+            ("STEP_ID", "3"),
+            ("NODEID", "1"),
+            ("NNODES", "2"),
+            ("JOB_NUM_NODES", "2"),
+        ] {
+            assert_eq!(
+                env.get(&format!("SPUR_{name}")).map(String::as_str),
+                Some(value),
+                "SPUR_{name}"
+            );
+            assert_eq!(
+                env.get(&format!("SLURM_{name}")).map(String::as_str),
+                Some(value),
+                "SLURM_{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_environment_job_context_overrides_a_submitted_value() {
+        let submitted = HashMap::from([("SLURM_JOB_ID".to_string(), "999".to_string())]);
+        let env = step_env_fixture(&submitted, &[], &HashMap::new());
+
+        assert_eq!(env.get("SLURM_JOB_ID").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn step_environment_applies_gpu_env_and_gpu_bind_overrides_it() {
+        let gpu_env = HashMap::from([
+            ("ROCR_VISIBLE_DEVICES".to_string(), "0,1".to_string()),
+            ("SPUR_JOB_GPUS".to_string(), "0,1".to_string()),
+        ]);
+        let env = step_env_fixture(&HashMap::new(), &[0, 1], &gpu_env);
+        assert_eq!(
+            env.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("0,1")
+        );
+
+        let bound = HashMap::from([("SPUR_GPU_BIND".to_string(), "map_gpu:1".to_string())]);
+        let env = step_env_fixture(&bound, &[0, 1], &gpu_env);
+        assert_eq!(
+            env.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(env.get("SPUR_JOB_GPUS").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn step_node_position_finds_this_host_and_defaults_to_the_first_node() {
+        assert_eq!(step_node_position("a,b,c", "b"), (1, 3));
+        assert_eq!(step_node_position("a,b,c", "z"), (0, 3));
+        assert_eq!(step_node_position("", "a"), (0, 1));
     }
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
