@@ -1820,17 +1820,15 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
         );
     }
 
-    // The agent spawns the PTY from the job's own environment and work dir, so
-    // everything srun would otherwise pass through SPUR_* env is dropped.
+    // A --pty step sends only the --export-filtered environment, not the SPUR_*
+    // variables srun sets for these flags.
     let env_scoped = args.cpu_bind.is_some()
         || args.gpu_bind.is_some()
         || args.label
-        || crate::env_defaults::was_cli_set(matches, "mpi")
-        || crate::env_defaults::was_cli_set(matches, "export");
+        || crate::env_defaults::was_cli_set(matches, "mpi");
     if env_scoped {
         warnings.push(
-            "srun: warning: a --pty step runs in the job's environment; \
-             --cpu-bind/--gpu-bind/--label/--mpi/--export are ignored"
+            "srun: warning: --cpu-bind/--gpu-bind/--label/--mpi are not applied to a --pty step"
                 .into(),
         );
     }
@@ -1855,7 +1853,8 @@ fn step_dispatch_kind(args: &SrunArgs) -> StepDispatchKind {
 }
 
 /// Warn on unsupported `--cpu-bind` modes and reject a spec that cannot cover
-/// `ntasks`. Buffered steps only — a `--pty` step forwards no env, so it warns.
+/// `ntasks`. Buffered steps only — a `--pty` step does not forward `--cpu-bind`,
+/// so it warns instead.
 fn validate_step_cpu_bind(environment: &HashMap<String, String>, ntasks: u32) -> Result<()> {
     warn_unsupported_cpu_bind(environment);
     if let Some(err) = spur_core::task_launch::map_cpu_bind_error(environment, ntasks)
@@ -2077,6 +2076,13 @@ mod tests {
         let warnings = pty_step_unsupported_warnings(&args, &matches);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--cpu-bind/--gpu-bind/--label/--mpi"));
+        assert!(!warnings[0].contains("--export"));
+    }
+
+    #[test]
+    fn pty_step_does_not_warn_that_export_is_ignored() {
+        let (args, matches) = parse_srun(&["srun", "--pty", "--export=NONE", "bash"]);
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
     }
 
     /// `--chdir` still sets the prolog/epilog working directory, so it gets its

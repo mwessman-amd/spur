@@ -72,9 +72,8 @@ Common options:
        (``SPUR_AUTH_TOKEN``, ``SPUR_REGISTRY_PASSWORD``) unless named. Default
        ``ALL``; env default ``SPUR_EXPORT_ENV``, then ``SRUN_EXPORT_ENV``, then
        ``SLURM_EXPORT_ENV`` (set by ``sbatch --export``). Under ``NONE`` a step
-       has no ``PATH``, so give the command's absolute path. Ignored for a
-       ``--pty`` step inside an existing allocation, which runs in the job's
-       environment.
+       has no ``PATH``, so give the command's absolute path. Applies to a
+       ``--pty`` step too.
    * - ``--partition``
      - ``-p``
      - Partition to run in.
@@ -85,14 +84,14 @@ Common options:
      -
      - Allocate a pseudo-terminal (use with an interactive shell). The shell
        gets the same environment as a plain ``srun`` step: your submitting
-       shell's variables (filtered by ``--export``, so ``PATH`` and
-       ``SPUR_CONTROLLER_ADDR`` carry over), the job and step variables, and the
-       GPU visibility variables. Inside an existing allocation this runs as an
-       interactive step: a single task on one node, started in the *job's*
-       working directory rather than your shell's. ``srun`` warns about the
-       flags that implies it must drop — ``--output``/``--error``/``--input``,
-       the task-sizing flags,
-       and ``--cpu-bind``/``--gpu-bind``/``--label``/``--mpi``. ``--chdir`` moves
+       shell's variables (filtered by ``--export``), the job and step variables,
+       and the GPU visibility variables, so a ``PATH`` or
+       ``SPUR_CONTROLLER_ADDR`` set in your shell carries over. Inside an
+       existing allocation this runs as an interactive step: a single task on
+       one node, started in the *job's* working directory rather than your
+       shell's. ``srun`` warns about the flags that implies it must drop —
+       ``--output``/``--error``/``--input``, the task-sizing flags, and
+       ``--cpu-bind``/``--gpu-bind``/``--label``/``--mpi``. ``--chdir`` moves
        the srun prolog/epilog but not the terminal. ``--container-image`` *is*
        honored — the interactive shell runs inside the container (see
        :doc:`running-containers`).

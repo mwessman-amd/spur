@@ -8162,7 +8162,7 @@ impl SlurmAgent for AgentService {
                             let (gpu_env, container_device_plan) = if gpu_devices.is_empty() {
                                 (HashMap::new(), None)
                             } else {
-                                let (host_plan, container_plan) = self
+                                let (mut host_plan, container_plan) = self
                                     .device_registry
                                     .lock()
                                     .await
@@ -8177,7 +8177,9 @@ impl SlurmAgent for AgentService {
                                             "GPU injection plan failed: {e}"
                                         ))
                                     })?;
-                                let env = host_plan.env.clone();
+                                // Merged into the step env with --gpu-bind precedence; cleared
+                                // so the executor doesn't re-apply the full allocation over it.
+                                let env = std::mem::take(&mut host_plan.env);
                                 host_device_plan = Some(host_plan);
                                 (env, Some(container_plan))
                             };
