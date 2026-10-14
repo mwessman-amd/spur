@@ -367,7 +367,17 @@ works unchanged. The most useful are below.
    * - ``SPUR_NODELIST``
      - The allocated node list.
    * - ``SPUR_CPUS_ON_NODE``
-     - CPUs available on the current node.
+     - CPUs allocated on the current node.
+   * - ``SPUR_JOB_CPUS``
+     - The exact cores allocated on the current node, as a cpulist
+       (e.g. ``32-63``) usable with ``taskset -c`` or ``numactl -C``. Spur-only,
+       no ``SLURM_*`` twin.
+   * - ``SPUR_MEM_PER_NODE``
+     - Memory allocated on the current node, in MB. Set only when memory was
+       requested (``--mem`` or ``--mem-per-cpu``).
+   * - ``SPUR_GPUS_ON_NODE``
+     - Number of GPUs allocated on the current node. Set only when GPUs were
+       requested.
    * - ``SPUR_PROCID``
      - The task's global rank (twin ``SLURM_PROCID``).
    * - ``SPUR_LOCALID``

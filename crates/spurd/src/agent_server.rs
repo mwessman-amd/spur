@@ -3050,6 +3050,56 @@ fn interactive_step_environment(
     environment
 }
 
+/// Allocation-size vars from the node's enforced grant, shared by every launch
+/// path so batch jobs and srun steps report the same budget.
+/// Memory and GPU counts are omitted when zero, as Slurm omits them when unset.
+/// `SPUR_JOB_CPUS` has no `SLURM_` twin: Slurm has no core-list variable.
+fn allocation_env(
+    cpus: u32,
+    cpu_ids: &[u32],
+    memory_mb: u64,
+    gpu_count: usize,
+) -> HashMap<String, String> {
+    let mut senv = SpurEnv::new();
+    senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
+    if !cpu_ids.is_empty() {
+        senv.set("SPUR_JOB_CPUS", format_cpu_list(cpu_ids));
+    }
+    if memory_mb > 0 {
+        senv.set_with_slurm_twin("SPUR_MEM_PER_NODE", memory_mb);
+    }
+    if gpu_count > 0 {
+        senv.set_with_slurm_twin("SPUR_GPUS_ON_NODE", gpu_count);
+    }
+    senv.into_map()
+}
+
+/// Kernel cpulist format (`0-3,8,10-11`), the same syntax as `cpuset.cpus` and
+/// `taskset -c`, so the value can be passed straight to either.
+fn format_cpu_list(cpu_ids: &[u32]) -> String {
+    let mut ids = cpu_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for id in ids {
+        match ranges.last_mut() {
+            Some((_, hi)) if *hi + 1 == id => *hi = id,
+            _ => ranges.push((id, id)),
+        }
+    }
+    ranges
+        .iter()
+        .map(|&(lo, hi)| {
+            if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The supervisor forks the workload after the gate opens, so its pid is not
 /// available the instant `start_job` returns. Its control socket does not
 /// start serving requests until that fork (openpty, container rootfs staging,
@@ -5218,10 +5268,6 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_NODELIST", &spec.nodelist);
         senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &spec.nodelist);
         senv.set_with_slurm_twin("SPURD_NODENAME", &hostname);
-        senv.set_with_slurm_twin(
-            "SPUR_CPUS_ON_NODE",
-            tasks_per_node.saturating_mul(spec.cpus_per_task.max(1)),
-        );
 
         if array_job_id != 0 {
             senv.set_with_slurm_twin("SPUR_ARRAY_JOB_ID", array_job_id);
@@ -5527,6 +5573,12 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        env.extend(allocation_env(
+            cpus,
+            &alloc_result.cpu_ids,
+            memory_mb,
+            allocated_device_ids.len(),
+        ));
         maybe_deny_gpu_env(&mut env, &allocated_device_ids);
 
         if let Some(ref mut cfg) = container_config {
@@ -6776,6 +6828,7 @@ impl SlurmAgent for AgentService {
             (env, Some(host_plan), Some(container_plan))
         };
         maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
+        let job_cpu_ids = self.allocation.lock().await.job_cpu_ids(job_id);
 
         let mut senv = SpurEnv::new();
         senv.extend(&req.environment);
@@ -6784,7 +6837,12 @@ impl SlurmAgent for AgentService {
         senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
         senv.set_with_slurm_twin("SPUR_NODELIST", &step_nodelist);
         senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &job_nodelist);
-        senv.set_with_slurm_twin("SPUR_CPUS_ON_NODE", cpus);
+        senv.extend(&allocation_env(
+            cpus,
+            &job_cpu_ids,
+            memory_mb,
+            gpu_devices.len(),
+        ));
         senv.extend(&gpu_env);
         let mut bind_env = HashMap::new();
         spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, &req.environment, &gpu_devices);
@@ -12566,6 +12624,55 @@ mod tests {
             environment.get("SHELL").map(String::as_str),
             Some("/bin/bash")
         );
+    }
+
+    #[test]
+    fn allocation_env_reports_the_node_grant_with_slurm_twins() {
+        let cpu_ids: Vec<u32> = (32..64).collect();
+        let env = allocation_env(32, &cpu_ids, 32768, 1);
+
+        assert_eq!(env.get("SPUR_JOB_CPUS").map(String::as_str), Some("32-63"));
+        assert!(!env.contains_key("SLURM_JOB_CPUS"));
+
+        for (name, value) in [
+            ("CPUS_ON_NODE", "32"),
+            ("MEM_PER_NODE", "32768"),
+            ("GPUS_ON_NODE", "1"),
+        ] {
+            assert_eq!(
+                env.get(&format!("SPUR_{name}")).map(String::as_str),
+                Some(value)
+            );
+            assert_eq!(
+                env.get(&format!("SLURM_{name}")).map(String::as_str),
+                Some(value)
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_env_omits_unrequested_memory_and_gpus() {
+        let env = allocation_env(4, &[], 0, 0);
+
+        assert_eq!(env.get("SLURM_CPUS_ON_NODE").map(String::as_str), Some("4"));
+        for name in [
+            "SPUR_JOB_CPUS",
+            "SPUR_MEM_PER_NODE",
+            "SLURM_MEM_PER_NODE",
+            "SPUR_GPUS_ON_NODE",
+            "SLURM_GPUS_ON_NODE",
+        ] {
+            assert!(!env.contains_key(name), "{name} must be unset");
+        }
+    }
+
+    #[test]
+    fn format_cpu_list_collapses_runs_into_kernel_cpulist_ranges() {
+        assert_eq!(format_cpu_list(&[0, 1, 2, 3]), "0-3");
+        assert_eq!(format_cpu_list(&[11, 0, 3, 2, 1, 8, 10]), "0-3,8,10-11");
+        assert_eq!(format_cpu_list(&[5]), "5");
+        assert_eq!(format_cpu_list(&[4, 4, 5]), "4-5");
+        assert_eq!(format_cpu_list(&[]), "");
     }
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {

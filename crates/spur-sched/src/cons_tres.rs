@@ -431,6 +431,14 @@ impl NodeAllocation {
         self.owners.get(&job_id).map(|owned| owned.run_attempt)
     }
 
+    /// Cores held by `job_id`; empty when it holds no reservation here.
+    pub fn job_cpu_ids(&self, job_id: u32) -> Vec<u32> {
+        self.owners
+            .get(&job_id)
+            .map(|owned| owned.result.cpu_ids.clone())
+            .unwrap_or_default()
+    }
+
     /// Release owned allocations whose job is neither live nor launching within
     /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
     /// or a dropped launch instead of stranding the node until spurd restart.
@@ -1001,6 +1009,20 @@ mod tests {
         node.restore_for_job(2, 1, &[4, 5], 8_000, &[]).unwrap();
         assert_eq!(node.claimable_cpu_ids(2, &[4, 5, 0]), vec![4, 5]);
         assert!(node.claimable_cpu_ids(3, &[0, 1]).is_empty());
+    }
+
+    #[test]
+    fn test_job_cpu_ids_returns_the_cores_each_job_holds() {
+        let mut node = make_node(8, 64_000, 0, "");
+        node.allocate_for_job(1, 1, 2, 8_000, &[]).unwrap();
+        node.allocate_for_job(2, 1, 3, 8_000, &[]).unwrap();
+
+        assert_eq!(node.job_cpu_ids(1), vec![0, 1]);
+        assert_eq!(node.job_cpu_ids(2), vec![2, 3, 4]);
+        assert!(node.job_cpu_ids(3).is_empty());
+
+        node.release_job(1);
+        assert!(node.job_cpu_ids(1).is_empty());
     }
 
     #[test]
