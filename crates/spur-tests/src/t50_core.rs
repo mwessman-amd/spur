@@ -1009,6 +1009,7 @@ address = "http://peer-a:6817"
                     container: None,
                     non_interactive: false,
                     execution_credential: String::new(),
+                    env_is_authoritative: true,
                 },
             )),
         };
@@ -1016,6 +1017,7 @@ address = "http://peer-a:6817"
             spur_proto::proto::interactive_input::Msg::Init(init) => {
                 assert_eq!(init.job_id, 10);
                 assert!(init.overlap);
+                assert!(init.env_is_authoritative);
                 assert_eq!(init.winsize.unwrap().cols, 80);
             }
             _ => panic!("expected Init variant"),

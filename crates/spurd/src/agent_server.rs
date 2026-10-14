@@ -3026,20 +3026,22 @@ fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::proces
     }
 }
 
-/// Builds a fresh interactive step's process environment, in the same
-/// precedence the old direct-fork paths used: a `TERM` default, the job's own
-/// session, the step's [`step_environment`], then host or fresh-container
-/// identity vars — later layers win so a fresh container's own GPU/identity
-/// vars are never shadowed by the parent session's.
+/// Builds a fresh interactive step's process environment. Pre-marker clients
+/// inherit the job's running session; current clients send the complete,
+/// export-filtered step environment. Host or fresh-container identity wins
+/// over either source.
 fn interactive_step_environment(
     session_env: Vec<(String, String)>,
+    step_env_is_authoritative: bool,
     job_env_vars: Vec<(String, String)>,
     host_identity_env: Option<HashMap<String, String>>,
     fresh_container_env: Option<HashMap<String, String>>,
 ) -> HashMap<String, String> {
     let mut environment: HashMap<String, String> =
         [("TERM".to_string(), "xterm-256color".to_string())].into();
-    environment.extend(session_env);
+    if !step_env_is_authoritative {
+        environment.extend(session_env);
+    }
     environment.extend(job_env_vars);
     if let Some(host_identity) = host_identity_env {
         environment.extend(host_identity);
@@ -8247,6 +8249,7 @@ impl SlurmAgent for AgentService {
                         array_task_id: None,
                         environment: interactive_step_environment(
                             Self::session_environ(&entry),
+                            init.env_is_authoritative,
                             step_env.into_iter().collect(),
                             host_identity_env,
                             fresh_container_env,
@@ -12568,8 +12571,13 @@ mod tests {
         fresh_container_env.insert("SPUR_JOB_GPUS".to_string(), "0,1".to_string());
         fresh_container_env.insert("HOME".to_string(), "/home/spur".to_string());
 
-        let environment =
-            interactive_step_environment(session_env, Vec::new(), None, Some(fresh_container_env));
+        let environment = interactive_step_environment(
+            session_env,
+            false,
+            Vec::new(),
+            None,
+            Some(fresh_container_env),
+        );
 
         assert_eq!(
             environment.get("ROCR_VISIBLE_DEVICES").map(String::as_str),
@@ -12607,8 +12615,13 @@ mod tests {
             ("SHELL".to_string(), "/bin/bash".to_string()),
         ]));
 
-        let environment =
-            interactive_step_environment(Vec::new(), job_env_vars, host_identity_env, None);
+        let environment = interactive_step_environment(
+            Vec::new(),
+            false,
+            job_env_vars,
+            host_identity_env,
+            None,
+        );
 
         assert_eq!(
             environment.get("TERM").map(String::as_str),
@@ -12634,6 +12647,24 @@ mod tests {
         assert_eq!(
             environment.get("SHELL").map(String::as_str),
             Some("/bin/bash")
+        );
+    }
+
+    #[test]
+    fn interactive_step_environment_drops_session_vars_for_authoritative_step_env() {
+        let session_env = vec![
+            ("SECRET".to_string(), "job-secret".to_string()),
+            ("PATH".to_string(), "/job/bin".to_string()),
+        ];
+        let job_env_vars = vec![("PATH".to_string(), "/step/bin".to_string())];
+
+        let environment =
+            interactive_step_environment(session_env, true, job_env_vars, None, None);
+
+        assert!(!environment.contains_key("SECRET"));
+        assert_eq!(
+            environment.get("PATH").map(String::as_str),
+            Some("/step/bin")
         );
     }
 

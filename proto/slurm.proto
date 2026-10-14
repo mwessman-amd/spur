@@ -1437,6 +1437,7 @@ message InitSession {
   ContainerSpec container = 9;  // Effective container the step runs in (empty image = host); resolved by the controller
   bool non_interactive = 10;    // Client stdin is not a TTY: input-stream close is stdin-EOF (drain output), not a hangup (SIGHUP)
   string execution_credential = 11; // Controller-signed step credential for a PTY launch; empty for attach
+  bool env_is_authoritative = 12; // True when env is the complete step environment; false preserves pre-field client behavior
 }
 
 message InteractiveInput {

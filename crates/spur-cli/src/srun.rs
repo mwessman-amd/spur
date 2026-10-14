@@ -1704,7 +1704,7 @@ async fn run_interactive_pty(
                     job_id,
                     step_id,
                     command.clone(),
-                    env.clone(),
+                    Some(env.clone()),
                     winsize,
                     true,
                     user,
@@ -1822,8 +1822,8 @@ fn pty_step_unsupported_warnings(args: &SrunArgs, matches: &ArgMatches) -> Vec<S
 
     // A --pty step sends only the --export-filtered environment, not the SPUR_*
     // variables srun sets for these flags.
-    let env_scoped = args.cpu_bind.is_some()
-        || args.gpu_bind.is_some()
+    let env_scoped = crate::env_defaults::was_cli_set(matches, "cpu_bind")
+        || crate::env_defaults::was_cli_set(matches, "gpu_bind")
         || args.label
         || crate::env_defaults::was_cli_set(matches, "mpi");
     if env_scoped {
@@ -2077,6 +2077,24 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("--cpu-bind/--gpu-bind/--label/--mpi"));
         assert!(!warnings[0].contains("--export"));
+    }
+
+    #[test]
+    #[serial(env_injection)]
+    fn pty_step_silent_when_binding_came_from_the_environment() {
+        let env = EnvGuard::new();
+        env.set("SPUR_CPU_BIND", "cores");
+        env.set("SPUR_GPU_BIND", "closest");
+
+        let matches = SrunArgs::command()
+            .try_get_matches_from(["srun", "--pty", "bash"])
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("from_arg_matches failed");
+        resolve_srun_env(&matches, &mut args).expect("env resolution failed");
+
+        assert!(args.cpu_bind.is_some());
+        assert!(args.gpu_bind.is_some());
+        assert!(pty_step_unsupported_warnings(&args, &matches).is_empty());
     }
 
     #[test]
