@@ -12615,13 +12615,8 @@ mod tests {
             ("SHELL".to_string(), "/bin/bash".to_string()),
         ]));
 
-        let environment = interactive_step_environment(
-            Vec::new(),
-            false,
-            job_env_vars,
-            host_identity_env,
-            None,
-        );
+        let environment =
+            interactive_step_environment(Vec::new(), false, job_env_vars, host_identity_env, None);
 
         assert_eq!(
             environment.get("TERM").map(String::as_str),
@@ -12658,8 +12653,7 @@ mod tests {
         ];
         let job_env_vars = vec![("PATH".to_string(), "/step/bin".to_string())];
 
-        let environment =
-            interactive_step_environment(session_env, true, job_env_vars, None, None);
+        let environment = interactive_step_environment(session_env, true, job_env_vars, None, None);
 
         assert!(!environment.contains_key("SECRET"));
         assert_eq!(
